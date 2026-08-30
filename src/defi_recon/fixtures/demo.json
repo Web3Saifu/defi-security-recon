@@ -1,0 +1,116 @@
+{
+  "protocols": [
+    {
+      "id": "demo-lend",
+      "name": "Northstar Lending",
+      "slug": "northstar-lending-demo",
+      "category": "Lending",
+      "chains": ["Ethereum"],
+      "tvl": 185000000,
+      "website": "https://northstar.example",
+      "defillama_url": "https://defillama.com/protocol/northstar-lending-demo",
+      "github_repos": ["northstar-fi/contracts"],
+      "audits": 2,
+      "listed_at": "2024-03-01T00:00:00Z",
+      "bounty": {
+        "type": "FIRST_PARTY",
+        "url": "https://northstar.example/security/bug-bounty",
+        "scope_url": "https://northstar.example/security/bug-bounty#scope",
+        "scope_status": "CONFIRMED",
+        "confidence": 0.97,
+        "claim": "Direct protocol bounty with published rewards and disclosure address"
+      },
+      "scope": {
+        "status": "CONFIRMED",
+        "source": "https://northstar.example/security/bug-bounty#scope",
+        "confidence": 0.95,
+        "in_scope": ["LendingPool proxy and active implementations on Ethereum", "Oracle adapters"],
+        "out_of_scope": ["Frontend and testnet deployments"],
+        "rules": ["Proof of concept required; no mainnet testing"],
+        "rewards": ["Critical: up to $250,000"]
+      },
+      "deployment": {
+        "status": "ACTIVE",
+        "chain": "Ethereum",
+        "contract_address": "0x1111111111111111111111111111111111111111",
+        "implementation_address": "0x2222222222222222222222222222222222222222",
+        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "deployment_time": "2026-08-28T09:00:00Z",
+        "source": "https://etherscan.io/tx/0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "confidence": 0.98
+      },
+      "changes": [
+        {
+          "repository": "northstar-fi/contracts",
+          "commit": "4f6c41d245ed8a938c100c4f7cb129b27e15a991",
+          "url": "https://github.com/northstar-fi/contracts/commit/4f6c41d245ed8a938c100c4f7cb129b27e15a991",
+          "committed_at": "2026-08-27T12:00:00Z",
+          "message": "Add new collateral and Chainlink oracle adapter with liquidation support",
+          "changed_files": ["contracts/oracles/ChainlinkAdapter.sol", "contracts/lending/LiquidationEngine.sol", "script/DeployCollateral.s.sol"],
+          "patches": ["+ contract ChainlinkAdapter { function latestPrice() external view returns (uint256) {} }", "+ function liquidateNewCollateral(address borrower) external { }"]
+        }
+      ]
+    },
+    {
+      "id": "demo-vault",
+      "name": "Harbor Vaults",
+      "slug": "harbor-vaults-demo",
+      "category": "Yield",
+      "chains": ["Base"],
+      "tvl": 72000000,
+      "website": "https://harbor.example",
+      "defillama_url": "https://defillama.com/protocol/harbor-vaults-demo",
+      "github_repos": ["harbor-fi/vaults"],
+      "audits": 1,
+      "listed_at": "2025-05-15T00:00:00Z",
+      "bounty": {
+        "type": "FIRST_PARTY",
+        "url": "https://harbor.example/security",
+        "scope_status": "EVIDENCE_NOT_FOUND",
+        "confidence": 0.94,
+        "claim": "Direct protocol bounty"
+      },
+      "changes": [
+        {
+          "repository": "harbor-fi/vaults",
+          "commit": "87da2a6261721584a5339b032e071a423e9cfc31",
+          "url": "https://github.com/harbor-fi/vaults/commit/87da2a6261721584a5339b032e071a423e9cfc31",
+          "committed_at": "2026-08-25T15:30:00Z",
+          "message": "Add strategy adapter and change totalAssets accounting for pending yield",
+          "changed_files": ["src/HarborVault.sol", "src/strategies/LendingAdapter.sol"],
+          "patches": ["- return idle + deployed; + return idle + deployed + pendingYield;", "+ contract LendingAdapter is StrategyBase {}"]
+        }
+      ]
+    },
+    {
+      "id": "demo-dex",
+      "name": "Meridian DEX",
+      "slug": "meridian-dex-demo",
+      "category": "Dexes",
+      "chains": ["Arbitrum"],
+      "tvl": 240000000,
+      "website": "https://meridian.example",
+      "defillama_url": "https://defillama.com/protocol/meridian-dex-demo",
+      "github_repos": ["meridian-fi/core"],
+      "audits": 4,
+      "listed_at": "2022-01-10T00:00:00Z",
+      "bounty": {
+        "type": "PLATFORM_HOSTED",
+        "url": "https://immunefi.com/bug-bounty/meridian",
+        "confidence": 0.98
+      },
+      "changes": [
+        {
+          "repository": "meridian-fi/core",
+          "commit": "9f1a67118143038879127499ee0b683e5e32f44c",
+          "url": "https://github.com/meridian-fi/core/commit/9f1a67118143038879127499ee0b683e5e32f44c",
+          "committed_at": "2026-08-29T08:00:00Z",
+          "message": "Add pool callback hook",
+          "changed_files": ["contracts/PoolHooks.sol"],
+          "patches": ["+ callback.onSwap(sender, amount0, amount1);"]
+        }
+      ]
+    }
+  ]
+}
+

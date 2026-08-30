@@ -1,0 +1,23 @@
+{
+  "protocol-slug": {
+    "github_repos": ["owner/contracts"],
+    "bounty": {
+      "type": "FIRST_PARTY",
+      "url": "https://protocol.example/security/bug-bounty",
+      "scope_url": "https://protocol.example/security/bug-bounty#scope",
+      "scope_status": "CONFIRMED",
+      "confidence": 0.98,
+      "claim": "Direct protocol bounty"
+    },
+    "deployment": {
+      "status": "ACTIVE",
+      "chain": "Ethereum",
+      "contract_address": "0x0000000000000000000000000000000000000000",
+      "implementation_address": "0x0000000000000000000000000000000000000000",
+      "transaction_hash": "0x...",
+      "deployment_time": "2026-08-30T00:00:00Z",
+      "source": "https://etherscan.io/tx/0x...",
+      "confidence": 0.99
+    }
+  }
+}

@@ -7,7 +7,8 @@ dist/
 build/
 *.egg-info/
 data/*.db
+data/*.db-*
+config/rpc-config.json
 reports/*.json
 reports/*.md
 !reports/.gitkeep
-

@@ -1,206 +1,251 @@
 from __future__ import annotations
 
-import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
-from .classifiers import category_matches, classify_change, score_candidate
-from .models import BountyType, Candidate, ScopeFinding
-from .sources import (
-    BountyDetector,
-    DefiLlamaSource,
-    GitHubSource,
-    HttpClient,
-    ScopeExtractor,
-    SourceError,
-    change_from_dict,
-    deployment_from_override,
-    load_demo_fixture,
-    parse_page,
-    protocol_from_dict,
-    _parse_github_repos,
+from .classifiers import classify_change, score_candidate, semantic_drift
+from .deployment import DeploymentVerifier, RpcRegistry, extract_address_artifacts, infer_chain
+from .github_source import GitHubSource, is_contract_path
+from .models import (
+    AddressArtifact,
+    BountyType,
+    Change,
+    Evidence,
+    JobStage,
+    Protocol,
+    ScopeFinding,
 )
-
-
-@dataclass(slots=True)
-class ResearchOptions:
-    category: str = "all"
-    days: int = 30
-    top: int = 10
-    min_score: int = 55
-    min_confidence: float = 0.85
-    min_tvl: float = 1_000_000
-    max_protocols: int = 100
-    max_commits: int = 12
-    first_party_only: bool = True
-    require_deployment: bool = False
-    new_integration_only: bool = False
-    demo: bool = False
-    overrides_path: Path | None = None
-
-
-@dataclass(slots=True)
-class ResearchResult:
-    candidates: list[Candidate]
-    scanned: int
-    eligible: int
-    warnings: list[str] = field(default_factory=list)
-    generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+from .net import HttpClient, RateLimitError, SourceError
+from .sources import (
+    DefiLlamaSource,
+    OfficialSiteResearcher,
+    classify_official_github_security,
+    extract_scope,
+    github_references,
+)
+from .storage import ReconStore
 
 
 Progress = Callable[[str], None]
 
 
-def load_overrides(path: Path | None) -> dict[str, Any]:
-    if path is None:
-        return {}
-    if not path.exists():
-        raise ValueError(f"override file does not exist: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("override file must be a JSON object keyed by protocol slug")
-    return data
+@dataclass(slots=True)
+class ResearchOptions:
+    category: str = "all"
+    protocol_slug: str = ""
+    days: int = 30
+    top: int = 20
+    min_score: int = 55
+    min_confidence: float = 0.85
+    work_limit: int = 0
+    time_budget_seconds: int = 900
+    until_complete: bool = False
+    max_site_pages: int = 16
+    refresh_hours: int = 24
+    sync_universe: bool = True
+    rpc_config: Path | None = None
 
 
-def discover_repositories(protocol, http: HttpClient) -> list[str]:
-    repos = list(protocol.github_repos)
-    if protocol.website:
-        try:
-            response = http.get(protocol.website)
-            _, links = parse_page(response.text, response.url)
-            repos.extend(_parse_github_repos(links))
-        except SourceError:
-            pass
-    return sorted(set(repos))
+@dataclass(slots=True)
+class ResearchResult:
+    universe_count: int = 0
+    new_protocols: int = 0
+    queued: int = 0
+    processed: int = 0
+    completed: int = 0
+    retried: int = 0
+    targets: list[dict] = field(default_factory=list)
+    stopped_reason: str = ""
+    generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    status: dict = field(default_factory=dict)
 
 
-def _fixture_scope(raw: dict[str, Any] | None) -> ScopeFinding:
-    if not raw:
-        return ScopeFinding()
-    from .models import Evidence
-
-    source = str(raw.get("source") or "")
-    confidence = float(raw.get("confidence") or 0)
-
-    def evidence_list(key: str) -> list[Evidence]:
-        return [Evidence(value, source, "fixture-official-bounty-page", confidence) for value in raw.get(key, [])]
-
-    return ScopeFinding(
-        status=str(raw.get("status") or "EVIDENCE_NOT_FOUND"),
-        in_scope=evidence_list("in_scope"),
-        out_of_scope=evidence_list("out_of_scope"),
-        rules=evidence_list("rules"),
-        rewards=evidence_list("rewards"),
-        confidence=confidence,
-    )
+def sync_universe(store: ReconStore, http: HttpClient, refresh_hours: int = 24) -> tuple[int, int]:
+    source = DefiLlamaSource(http)
+    protocols, payload_hash = source.fetch_universe()
+    return store.sync_universe(protocols, f"{source.API}/protocols", payload_hash, refresh_hours)
 
 
-def _run_demo(options: ResearchOptions, progress: Progress) -> ResearchResult:
-    fixture = load_demo_fixture()
-    candidates: list[Candidate] = []
-    scanned = 0
-    eligible = 0
-    from .sources import _bounty_from_override
-
-    for raw in fixture["protocols"]:
-        protocol = protocol_from_dict(raw)
-        if not category_matches(protocol.category, options.category) or protocol.tvl < options.min_tvl:
-            continue
-        scanned += 1
-        bounty = _bounty_from_override(raw["bounty"])
-        if options.first_party_only and bounty.bounty_type != BountyType.FIRST_PARTY:
-            continue
-        eligible += 1
-        deployment = deployment_from_override(raw.get("deployment"))
-        scope = _fixture_scope(raw.get("scope"))
-        for raw_change in raw.get("changes", []):
-            change = classify_change(change_from_dict(raw_change), protocol.category)
-            if not change.meaningful:
-                continue
-            candidate = score_candidate(
-                protocol,
-                bounty,
-                change,
-                deployment,
-                scope,
-                require_first_party=options.first_party_only,
-                require_deployment=options.require_deployment,
-            )
-            if options.new_integration_only and not change.integration_novelty:
-                continue
-            if not candidate.gate_failures and candidate.score >= options.min_score and candidate.confidence >= options.min_confidence:
-                candidates.append(candidate)
-    progress(f"demo: screened {scanned} protocols; {eligible} passed bounty eligibility")
-    candidates.sort(key=lambda item: (item.score, item.confidence), reverse=True)
-    return ResearchResult(candidates[: options.top], scanned, eligible)
-
-
-def run_research(options: ResearchOptions, progress: Progress | None = None) -> ResearchResult:
+def run_research(store: ReconStore, options: ResearchOptions, progress: Progress | None = None,
+                 http: HttpClient | None = None) -> ResearchResult:
     progress = progress or (lambda _: None)
-    if options.demo:
-        return _run_demo(options, progress)
+    http = http or HttpClient()
+    result = ResearchResult()
+    store.recover_leases()
+    if options.sync_universe:
+        progress("Syncing the complete DeFiLlama protocol universe (no TVL cutoff or truncation)")
+        result.universe_count, result.new_protocols = sync_universe(store, http, options.refresh_hours)
+        progress(f"Stored {result.universe_count} DeFiLlama protocols ({result.new_protocols} new)")
 
-    overrides = load_overrides(options.overrides_path)
-    http = HttpClient()
-    llama = DefiLlamaSource(http)
-    bounty_detector = BountyDetector(http)
-    scope_extractor = ScopeExtractor(http)
+    work_items = store.work_items(options.category, options.work_limit, options.protocol_slug)
+    result.queued = len(work_items)
     github = GitHubSource(http)
-    warnings: list[str] = []
+    llama = DefiLlamaSource(http)
+    site = OfficialSiteResearcher(http, options.max_site_pages)
+    verifier = DeploymentVerifier(http, RpcRegistry.load(options.rpc_config))
+    started = time.monotonic()
+    budget = 0 if options.until_complete else options.time_budget_seconds
 
-    progress("fetching DeFiLlama protocol universe")
-    protocols = [
-        protocol
-        for protocol in llama.protocols()
-        if category_matches(protocol.category, options.category) and protocol.tvl >= options.min_tvl
-    ]
-    protocols.sort(key=lambda item: item.tvl, reverse=True)
-    protocols = protocols[: options.max_protocols]
-    scanned = len(protocols)
-    eligible = 0
-    candidates: list[Candidate] = []
+    for index, protocol in enumerate(work_items, 1):
+        if budget and time.monotonic() - started >= budget:
+            result.stopped_reason = f"time budget of {budget}s reached; rerun to resume"
+            break
+        progress(f"[{index}/{len(work_items)}] {protocol.name}: official-source discovery")
+        store.mark_running(protocol.id)
+        try:
+            candidates = _research_protocol(protocol, options, store, http, llama, site, github, verifier, progress)
+            for candidate in candidates:
+                store.save_target(candidate)
+            store.mark_complete(protocol.id, options.refresh_hours)
+            result.completed += 1
+        except RateLimitError as exc:
+            store.mark_retry(protocol.id, str(exc), retry_hours=1)
+            result.retried += 1
+            result.stopped_reason = str(exc) + "; rerun after the reset to resume"
+            break
+        except SourceError as exc:
+            store.mark_retry(protocol.id, str(exc), retry_hours=6 if exc.retryable else 24)
+            result.retried += 1
+            progress(f"  retry queued: {exc}")
+        except KeyboardInterrupt:
+            store.mark_retry(protocol.id, "interrupted by user", retry_hours=0)
+            raise
+        except Exception as exc:
+            store.mark_retry(protocol.id, f"{type(exc).__name__}: {exc}", retry_hours=6)
+            result.retried += 1
+            progress(f"  retry queued after unexpected error: {type(exc).__name__}: {exc}")
+        result.processed += 1
 
-    for index, protocol in enumerate(protocols, 1):
-        progress(f"[{index}/{scanned}] screening {protocol.name}")
-        override = overrides.get(protocol.slug, {})
-        bounty = bounty_detector.detect(protocol, override.get("bounty"))
-        if options.first_party_only and bounty.bounty_type != BountyType.FIRST_PARTY:
-            continue
-        eligible += 1
-        scope = _fixture_scope(override.get("scope")) if override.get("scope") else scope_extractor.extract(bounty)
-        protocol = llama.enrich(protocol)
-        if override.get("github_repos"):
-            protocol.github_repos = sorted(set(protocol.github_repos + list(override["github_repos"])))
-        repositories = discover_repositories(protocol, http)
-        if not repositories:
-            warnings.append(f"{protocol.name}: no GitHub repository evidence found")
-            continue
+    result.targets = store.target_records(options.category, options.days, options.min_score,
+                                          options.min_confidence, options.top)
+    result.status = store.status()
+    return result
 
-        changes = []
-        for repository in repositories[:3]:
-            changes.extend(github.recent_changes(repository, options.days, options.max_commits))
-        classified = [classify_change(change, protocol.category) for change in changes]
-        meaningful = [change for change in classified if change.meaningful]
-        if not meaningful:
-            continue
-        meaningful.sort(key=lambda item: (item.significance, item.committed_at), reverse=True)
-        deployment = deployment_from_override(override.get("deployment"))
-        for change in meaningful[:3]:
-            candidate = score_candidate(
-                protocol,
-                bounty,
-                change,
-                deployment,
-                scope,
-                require_first_party=options.first_party_only,
-                require_deployment=options.require_deployment,
+
+def _research_protocol(protocol: Protocol, options: ResearchOptions, store: ReconStore, http: HttpClient,
+                       llama: DefiLlamaSource, site: OfficialSiteResearcher, github: GitHubSource,
+                       verifier: DeploymentVerifier, progress: Progress) -> list:
+    protocol = llama.fetch_detail(protocol)
+    discovery = site.research(protocol)
+    if discovery.bounty.bounty_type == BountyType.PLATFORM_HOSTED:
+        # Official evidence already fails the user's first-party eligibility gate. Preserve the completed
+        # record without spending hundreds of GitHub requests on a protocol that cannot enter the target set.
+        store.save_discovery(protocol.id, discovery.bounty, discovery.scope, [], discovery.pages)
+        progress("  official source confirms a platform-hosted bounty; first-party gate closed")
+        return []
+    seed_repos, seed_owners = github_references(protocol.github_refs)
+    seed_repos.update(discovery.github_repos)
+    seed_owners.update(discovery.github_owners)
+
+    progress(f"  GitHub discovery: {len(seed_repos)} direct repositories, {len(seed_owners)} owners")
+    repositories = github.discover_repositories(seed_repos, seed_owners) if seed_repos or seed_owners else []
+    official_security_pages = []
+    security_repositories = [repo for repo in repositories if repo.contract_files > 0 or repo.relevance >= 2][:25]
+    for repository in security_repositories:
+        # Only accept repository security policy as official after the site/DeFiLlama supplied its repo or owner.
+        if repository.source_evidence:
+            official_security_pages.extend(github.security_documents(repository))
+
+    bounty = discovery.bounty
+    all_scope_pages = list(discovery.pages)
+    if bounty.bounty_type != BountyType.FIRST_PARTY and official_security_pages:
+        github_bounty = classify_official_github_security(protocol.website, official_security_pages)
+        if github_bounty.bounty_type in {BountyType.FIRST_PARTY, BountyType.PLATFORM_HOSTED}:
+            bounty = github_bounty
+    all_scope_pages.extend(official_security_pages)
+    scope = extract_scope(protocol, all_scope_pages, bounty)
+    store.save_discovery(protocol.id, bounty, scope, repositories, all_scope_pages)
+    progress(f"  bounty={bounty.bounty_type.value}, scope={scope.status}, repositories={len(repositories)}")
+
+    # This is the required eligibility funnel, but every protocol retains its completed evidence record.
+    if bounty.bounty_type != BountyType.FIRST_PARTY:
+        return []
+    contract_repositories = [repo for repo in repositories if repo.contract_files > 0 and repo.relevance > 0]
+    if not contract_repositories:
+        return []
+
+    store.set_stage(protocol.id, JobStage.CHANGE_SCAN)
+    candidates = []
+    for repository in contract_repositories:
+        checkpoint = store.repo_checkpoint(protocol.id, repository.full_name)
+        since = checkpoint - timedelta(minutes=10) if checkpoint else datetime.now(timezone.utc) - timedelta(days=options.days)
+        summaries = github.recent_commit_summaries(repository, since)
+        latest_commit = str(summaries[0].get("sha") or "") if summaries else ""
+        progress(f"  {repository.full_name}: {len(summaries)} commits since {since.date()}")
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="github-commit") as executor:
+            for change in executor.map(lambda item: _analyze_commit(protocol, repository, item, github), summaries):
+                if change is None:
+                    continue
+                store.save_change(protocol.id, change)
+                if not change.meaningful:
+                    continue
+                store.set_stage(protocol.id, JobStage.DEPLOYMENT)
+                deployments = _deployments_for_change(protocol, repository, change, scope, github, verifier, store)
+                store.set_stage(protocol.id, JobStage.ANALYSIS)
+                candidate = score_candidate(protocol, bounty, scope, change, deployments)
+                if not candidate.gate_failures:
+                    candidates.append(candidate)
+        store.save_checkpoint(protocol.id, repository.full_name, latest_commit)
+    return candidates
+
+
+def _analyze_commit(protocol: Protocol, repository, summary: dict, github: GitHubSource) -> Change | None:
+    sha = str(summary.get("sha") or "")
+    if not sha:
+        return None
+    detail = github.commit_detail(repository, sha)
+    all_deltas = github.file_deltas(detail)
+    contract_deltas = [item for item in all_deltas if is_contract_path(item.filename)]
+    if not contract_deltas:
+        return None
+    parent = str(((detail.get("parents") or [{}])[0]).get("sha") or "")
+    file_pairs = []
+    for delta in contract_deltas:
+        try:
+            old_source = "" if delta.status == "added" or not parent else github.raw_file(
+                repository, parent, delta.previous_filename or delta.filename
             )
-            if options.new_integration_only and not change.integration_novelty:
-                continue
-            if not candidate.gate_failures and candidate.score >= options.min_score and candidate.confidence >= options.min_confidence:
-                candidates.append(candidate)
+            new_source = "" if delta.status == "removed" else github.raw_file(repository, sha, delta.filename)
+        except SourceError:
+            old_source, new_source = "", ""
+        file_pairs.append((delta.filename, old_source, new_source))
+    drift = semantic_drift(file_pairs, [item.patch for item in contract_deltas], protocol.category)
+    commit_data = detail.get("commit") or {}
+    message = str(commit_data.get("message") or "").splitlines()[0]
+    commit_url = str(detail.get("html_url") or f"https://github.com/{repository.full_name}/commit/{sha}")
+    return classify_change(Change(
+        repository.full_name, sha, parent, commit_url, github.commit_time(detail), message, all_deltas, drift,
+        evidence=[Evidence("GitHub commit and changed production-contract files", sha, commit_url,
+                           "github-commit", 1.0, excerpt=message)],
+    ))
 
-    candidates.sort(key=lambda item: (item.score, item.confidence), reverse=True)
-    return ResearchResult(candidates[: options.top], scanned, eligible, warnings)
+
+def _deployments_for_change(protocol: Protocol, repository, change: Change, scope: ScopeFinding,
+                            github: GitHubSource, verifier: DeploymentVerifier, store: ReconStore) -> list:
+    changed_paths = {item.filename for item in change.files}
+    artifacts = github.deployment_artifacts(repository, change.commit)
+    address_artifacts = [
+        item for item in extract_address_artifacts(protocol, repository.full_name, change.commit, artifacts)
+        if item.path in changed_paths
+    ]
+    # Scope addresses are verified too, but never associated with the commit merely because they are in scope.
+    for item in scope.addresses:
+        chain_hint = scope.chains[0].value if len(scope.chains) == 1 else (protocol.chains[0] if len(protocol.chains) == 1 else "")
+        chain, chain_id = infer_chain(chain_hint, chain_hint, protocol)
+        address_artifacts.append(AddressArtifact(
+            repository.full_name, change.commit, "official-bounty-scope", item.value, chain, chain_id,
+            "in-scope contract", evidence=[item.evidence],
+        ))
+    unique: dict[tuple[str, int | None], AddressArtifact] = {}
+    for artifact in address_artifacts:
+        unique[(artifact.address.lower(), artifact.chain_id)] = artifact
+    deployments = []
+    for artifact in list(unique.values())[:150]:
+        deployment = verifier.verify(artifact, change)
+        store.save_deployment(protocol.id, deployment)
+        deployments.append(deployment)
+    return deployments

@@ -1,147 +1,169 @@
-# DeFi Security Recon
+# DeFi Security Recon V1–V5
 
-An evidence-first reconnaissance agent that reduces a DeFi protocol universe to a small list of security research leads. It does **not** claim that a recent commit is deployed or vulnerable. Every important claim carries a source, source type, confidence, and observation time.
+Live-source, evidence-first reconnaissance across the complete DeFiLlama protocol universe.
 
-This repository implements the V1 pipeline from the supplied design:
+This is a resumable research pipeline—not a demo-data target generator and not a vulnerability detector. It stores every protocol returned by DeFiLlama, progressively enriches each protocol from official and on-chain sources, and only ranks records that satisfy explicit evidence gates.
 
-```text
-DeFiLlama universe
-  -> category and TVL eligibility
-  -> conservative first-party bounty detection
-  -> GitHub repository discovery
-  -> recent contract-change collection
-  -> category-aware change classification
-  -> evidence gates and scoring
-  -> Markdown + JSON report
-  -> SQLite research memory
-```
+## What is implemented
 
-The deployment, scope, and normalized database models are already present so later phases can be added without changing the output contract. V1 never invents deployment evidence: an unverified code change is capped at `WATCHLIST`.
+### V1 — Full universe, bounty, and contract changes
 
-## Quick start
+- Downloads `https://api.llama.fi/protocols` without a TVL cutoff or protocol-count truncation.
+- Persists every protocol and creates a resumable research job for each one.
+- Crawls official websites, security paths, responsible-disclosure pages, and relevant same-domain links.
+- Distinguishes direct first-party bounties from platform-hosted bounties.
+- Discovers GitHub repositories from DeFiLlama metadata and official-site links.
+- Expands officially linked GitHub organizations and identifies repositories containing production contract files.
+- Reads official repository `SECURITY.md` policies.
+- Collects all recent commits within the selected window, subject to GitHub pagination and rate limits.
+- Rejects docs, dependency, mock, and test-only changes.
+- Ranks up to 20 evidence-qualified records by default; `--top` can narrow or expand the result.
 
-Python 3.11 or newer is the only runtime requirement.
+### V2 — Deployment verification
+
+- Extracts addresses and transaction hashes from official repository deployment/address/broadcast artifacts.
+- Extracts explicitly in-scope contract addresses from first-party bounty pages.
+- Uses configured JSON-RPC endpoints to call `eth_getCode`, `eth_getStorageAt`, `eth_call`, transaction receipts, and blocks.
+- Resolves ERC-1967 implementation, beacon, and admin slots.
+- Resolves ERC-1167 minimal-proxy implementations.
+- Checks that the current implementation also has runtime bytecode.
+- Looks up verified source using Sourcify API v2.
+- Separates `ONCHAIN_CODE` from `PROXY_ACTIVE`.
+- Associates a deployment with a GitHub change only when the deployment artifact itself changed in that commit.
+
+### V3 — Deterministic semantic drift
+
+- Downloads old and new versions of every changed production contract.
+- Extracts contracts, functions, modifiers, events, errors, imports, state variables, low-level/external calls, and literal addresses.
+- Compares old and new semantic surfaces.
+- Records added/removed/changed functions, state layout changes, imports, calls, addresses, and new integrations.
+- Produces a bounded drift summary without claiming that a bug exists.
+
+### V4 — Category security lenses
+
+Current lenses include lending, DEX, liquid staking, restaking, yield/vault, stablecoin/CDP, bridges,
+derivatives/perpetuals, options, RWA, oracle, asset management, on-chain capital allocation, liquidity
+management, intent/solver, aggregator, insurance, prediction markets, and NFT finance. Generic lenses cover
+external calls, access control, upgrades, accounting, oracles, and cross-chain messaging.
+
+The security-smell engine detects new callbacks, tokens, oracles, accounting, price dependencies, permissions, upgrade authority, initialization, storage changes, rounding, decimals, liquidation, shares, fees, withdrawals, strategies, bridges, adapters, and trust assumptions.
+
+### V5 — Evidence-backed scope extraction
+
+- Parses HTML and Markdown heading sections rather than applying one regex to an entire page.
+- Extracts in-scope and out-of-scope text, addresses, chains, repositories, rules, reward amounts, PoC requirements, KYC, mainnet-testing restrictions, responsible disclosure, and known-issue exclusions.
+- Stores the source URL, exact excerpt, capture time, content hash, and confidence with each claim.
+- Returns `EVIDENCE_NOT_FOUND` when the official source does not establish a field.
+
+## Requirements
+
+- Python 3.11+
+- A GitHub token for a complete crawl. Public unauthenticated access is too rate-limited for organization/repository/commit analysis.
+- JSON-RPC URLs for chains whose deployments should be verified.
+
+No third-party Python packages are required.
+
+## Setup
 
 ```powershell
 cd E:\FY\defi-security-recon
 $env:PYTHONPATH = "src"
-python -m defi_recon demo
+$env:GITHUB_TOKEN = gh auth token
 ```
 
-The demo is deterministic and offline. It proves all important branches:
+Copy [the RPC configuration example](config/rpc-config.example.json) to a private file and replace the placeholder endpoints. The private file should not be committed. Alternatively, configure endpoints through variables such as `RPC_URL_1`, `RPC_URL_8453`, and `RPC_URL_42161`.
 
-- an active, scoped, first-party bounty lead reaches `E5`;
-- a meaningful but deployment-unverified change remains `E2 / WATCHLIST`;
-- a platform-hosted bounty is removed by the hard filter.
+## Run
 
-For a live scan:
+First ingest the complete DeFiLlama universe:
 
 ```powershell
-$env:PYTHONPATH = "src"
-$env:GITHUB_TOKEN = "your-read-only-token"
-python -m defi_recon research lending --days 30 --top 10 --max-protocols 100
+python -m defi_recon sync
 ```
 
-Or install the command in a virtual environment:
+Inspect coverage:
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install -e .
-.venv\Scripts\defi-recon research lending --days 30 --top 10
+python -m defi_recon status
 ```
 
-The live adapters use the public [DeFiLlama API](https://defillama.com/docs/api) and GitHub's [REST commit endpoints](https://docs.github.com/en/rest/commits/commits). A GitHub token is strongly recommended because commit-detail analysis consumes API requests; the token only needs public repository read access.
+Research every queued protocol until the queue is empty or an upstream rate limit stops the run:
 
-## Commands
-
-```text
-defi-recon research all
-defi-recon research lending --days 30 --top 10
-defi-recon research dex --min-score 70
-defi-recon research lending --new-integration
-defi-recon research lending --deployment-verified
-defi-recon research lending --overrides config/my-evidence.json
-defi-recon demo lending
-defi-recon history
+```powershell
+python -m defi_recon research all --until-complete --rpc-config config/rpc-config.json
 ```
 
-Useful controls:
+The job is resumable. Run the same command again after a rate-limit reset or interruption. Completed evidence remains in `data/recon-v2.db`.
 
-| Option | Default | Meaning |
-|---|---:|---|
-| `--days` | 30 | GitHub collection window |
-| `--top` | 10 | Maximum report entries |
-| `--min-score` | 55 | Minimum normalized opportunity score |
-| `--min-confidence` | 0.85 | Minimum mean confidence of established claims |
-| `--min-tvl` | 1,000,000 | Economic-value prescreen |
-| `--max-protocols` | 100 | Bounded live crawl size |
-| `--max-commits` | 12 | Commit details inspected per repository |
-| `--include-platform-bounties` | off | Disable the first-party hard gate |
-| `--deployment-verified` | off | Require explicit `ACTIVE` deployment evidence |
-| `--new-integration` | off | Keep only new trust-boundary signals |
-| `--no-save` | off | Do not write SQLite history |
+Category-specific research is isolated:
 
-Reports are saved under `reports/`; normalized state is saved to `data/recon.db`.
+```powershell
+python -m defi_recon research lending --until-complete --rpc-config config/rpc-config.json
+python -m defi_recon research dex --until-complete --rpc-config config/rpc-config.json
+```
 
-## Evidence levels and gates
+For a bounded operational run, use the soft time budget. It is checked between protocol jobs, so an in-flight
+protocol is allowed to finish or reach a source timeout before the runner stops:
 
-| Level | Required evidence |
+```powershell
+python -m defi_recon research all --time-budget 900 --rpc-config config/rpc-config.json
+```
+
+Regenerate a report without crawling:
+
+```powershell
+python -m defi_recon report lending --days 30 --top 10
+```
+
+Inspect one protocol’s evidence and job state:
+
+```powershell
+python -m defi_recon protocol aave
+```
+
+## Coverage semantics
+
+Reports always state:
+
+- how many DeFiLlama protocols are stored;
+- how many protocol jobs are complete;
+- whether the report covers the whole universe;
+- why a crawl stopped;
+- which records need retrying.
+
+An incomplete crawl is prominently labeled. A protocol missing from the target list is not treated as rejected until its evidence job is complete.
+
+## Evidence semantics
+
+| State | Meaning |
 |---|---|
-| `E0` | No useful evidence |
-| `E1` | GitHub commit only |
-| `E2` | Meaningful contract change + commit |
-| `E3` | Deployment evidence |
-| `E4` | Current active implementation confirmed |
-| `E5` | First-party bounty + active deployment + sensitive change |
+| `NO_BOUNTY_FOUND` | The checked official sources yielded no qualifying evidence; absence is not proven. |
+| `ONCHAIN_CODE` | The address currently has runtime bytecode. It does not prove association with a commit. |
+| `VERIFIED_SOURCE` | Sourcify has a source record for the address. |
+| `PROXY_ACTIVE` | The current proxy storage resolves to an implementation that has runtime bytecode. |
+| `ARTIFACT_CHANGED_IN_COMMIT` | An official deployment artifact containing the address changed in the analyzed commit. |
+| `E2` | A meaningful production-contract change is confirmed. |
+| `E3` | An associated deployment has on-chain evidence. |
+| `E4` | An associated current proxy implementation is confirmed. |
+| `E5` | First-party bounty + sensitive change + associated active proxy evidence. |
 
-Hard gates run before promotion:
+GitHub changes without an associated active deployment can never be promoted above `WATCHLIST`.
 
-1. A first-party bounty must be established unless explicitly disabled.
-2. A meaningful production-code file must have changed; docs and test-only commits fail.
-3. `--deployment-verified` requires `ACTIVE`, not merely `DEPLOYED` or a deployment script.
-4. Failed gates are excluded, not rescued by additive scoring.
+## Source authority
 
-`NO_BOUNTY_FOUND` only means an official site was reachable but the crawler found no bounty evidence. `UNKNOWN` means it could not establish enough evidence to decide. Neither state means the protocol definitely has no bounty.
+The pipeline uses:
 
-## Scoring
+- DeFiLlama for protocol universe, categories, chains, and TVL;
+- official protocol domains and officially linked repositories for bounty and scope;
+- GitHub’s API and raw immutable commit content for changes and deployment artifacts;
+- chain JSON-RPC for runtime bytecode and proxy state;
+- Sourcify API v2 for verified-source lookup.
 
-The 100-point score follows the supplied architecture:
+It does not use synthetic protocols, fabricated addresses, manual score overrides, or LLM guesses as evidence.
 
-| Signal | Points |
-|---|---:|
-| First-party bounty | 20 |
-| Change freshness | 20 |
-| Change significance | 20 |
-| Security sensitivity | 15 |
-| Integration novelty | 10 |
-| TVL/value | 5 |
-| Low competition heuristic | 5 |
-| Scope clarity | 5 |
+## Scaling model
 
-Freshness and novelty are separate. Category lenses recognize lending, DEX, liquid-staking, yield/vault, stablecoin, and CDP terminology. Unknown categories still receive generic upgradeability, accounting, oracle, external-call, access-control, and cross-chain lenses.
-
-Competition is visibly labeled a heuristic. It uses TVL, published audit count, and protocol age; it is not represented as factual evidence of researcher activity.
-
-## Adding verified evidence
-
-Automatic on-chain deployment verification is deliberately not faked in V1. Add known official/on-chain evidence through an overrides file using [the example](config/protocol-overrides.example.json):
-
-```powershell
-python -m defi_recon research lending --overrides config/my-evidence.json --deployment-verified
-```
-
-Overrides are keyed by the DeFiLlama slug and can supply:
-
-- GitHub repositories that were not discoverable from official metadata;
-- a directly verified first-party bounty URL;
-- exact scope evidence;
-- active proxy/implementation and transaction evidence.
-
-Treat overrides as curated evidence, not as a way to force a score. Use official pages and explorer/on-chain sources, and set confidence conservatively.
-
-## Data model
-
-SQLite stores `runs`, `protocols`, `bounties`, `changes`, `deployments`, and `targets`. Raw evidence is preserved as JSON alongside normalized query fields. The JSON report is the stable machine-readable handoff for a later deployment verifier, semantic drift analyzer, or security reasoning agent.
+“Research all protocols” does not mean repeating every expensive request every day. Initial ingestion creates one persistent job per protocol. Subsequent runs revisit records after `next_scan_at`, scan commits since repository checkpoints, and retry unresolved sources independently. This makes full-universe coverage practical while preserving an auditable terminal state for every DeFiLlama protocol.
 
 ## Test
 
@@ -150,23 +172,14 @@ $env:PYTHONPATH = "src"
 python -m unittest discover -s tests -v
 ```
 
-The suite covers category isolation, docs/test false-positive rejection, category security lenses, evidence-level promotion, first-party gating, platform rejection, scope extraction, SSRF defense for literal private URLs, deployment gating, and normalized persistence.
+Tests cover full-universe persistence, zero-TVL retention, first-party/platform separation, HTML and Markdown scope sections, semantic Solidity drift, category lenses, deployment artifact provenance, ERC-1967 active-implementation verification, and deployment-association gating.
 
-## Current boundaries
+## Honest limitations
 
-- JavaScript-rendered bounty pages may require a future browser adapter.
-- Official-site heuristics are intentionally conservative and can return `UNKNOWN`.
-- GitHub metadata does not prove deployment; only supplied on-chain evidence can do that in V1.
-- Scope extraction is deterministic and section-based. Ambiguous prose stays `EVIDENCE_NOT_FOUND`.
-- The crawler is bounded and synchronous so API usage is predictable. Scheduled execution and worker queues belong in the next operational phase.
-- The tool prioritizes where to investigate. It does not find bugs, test mainnet, or claim exploitability.
-
-## Next implementation phases
-
-1. RPC/explorer deployment verifier with EIP-1967, beacon, diamond, and non-proxy strategies.
-2. Old-production versus new-production ABI/storage/semantic drift.
-3. Integration graph and first-seen trust-boundary memory.
-4. Stronger category-specific lenses and explicit security-smell output.
-5. Structured scope and rule extraction for JS-rendered official pages.
-6. Audits/contests/researcher-activity competition inputs.
-7. Bounded reasoning handoff that asks what changed without claiming a bug.
+- Websites requiring JavaScript may remain unresolved until a browser-rendering adapter is added.
+- Non-EVM chains require chain-specific deployment verifiers; current automated RPC verification is EVM-focused.
+- Diamond proxies are identified by repository/code semantics but are not yet resolved facet-by-facet on-chain.
+- A deployment can occur without a committed deployment artifact. In that case the agent intentionally leaves commit association unproven.
+- Contract source parsing is deterministic and conservative, not a full Solidity compiler AST. Complex generated code can require manual inspection.
+- “First-party” requires an official-domain or officially linked repository policy with direct submission evidence. Ambiguous programs remain `UNKNOWN` or `NO_BOUNTY_FOUND`.
+- The system prioritizes research opportunities. It does not prove exploitability or generate vulnerability findings.

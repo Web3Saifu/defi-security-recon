@@ -1,188 +1,189 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import ssl
-import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from importlib.resources import files
-from ipaddress import ip_address
 from typing import Any, Iterable
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
-from urllib.request import Request, build_opener
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from .models import (
     BountyFinding,
     BountyType,
-    Change,
-    Deployment,
-    DeploymentStatus,
     Evidence,
+    PageDocument,
     Protocol,
     ScopeFinding,
+    ScopeItem,
     parse_datetime,
+    stable_hash,
     utc_now,
 )
+from .net import HttpClient, SourceError
 
 
-USER_AGENT = "defi-security-recon/0.1 (+evidence-first research tool)"
 PLATFORM_HOSTS = {
-    "immunefi.com",
-    "sherlock.xyz",
-    "cantina.xyz",
-    "hackenproof.com",
-    "code4rena.com",
-    "bugcrowd.com",
-    "hackerone.com",
+    "immunefi.com", "sherlock.xyz", "cantina.xyz", "hackenproof.com", "code4rena.com",
+    "bugcrowd.com", "hackerone.com",
 }
-BOUNTY_PATHS = (
-    "/.well-known/security.txt",
-    "/security",
-    "/bug-bounty",
-    "/security/bug-bounty",
-    "/security-researchers",
-    "/docs/security",
-    "/docs/bug-bounty",
-    "/security-policy",
+SECURITY_PATHS = (
+    "/.well-known/security.txt", "/security.txt", "/security", "/bug-bounty",
+    "/security/bug-bounty", "/security-researchers", "/responsible-disclosure",
+    "/docs/security", "/docs/bug-bounty", "/security-policy", "/terms",
 )
+RELEVANT_TERMS = (
+    "security", "bug-bounty", "bug_bounty", "bounty", "responsible-disclosure", "disclosure",
+    "researcher", "audit", "scope", "security-policy",
+)
+BINARY_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".zip", ".tar", ".gz", ".mp4", ".webm")
+ADDRESS_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
+GITHUB_RE = re.compile(r"https?://(?:www\.)?github\.com/([^/#?]+)/?([^/#?]*)", re.I)
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+MONEY_RE = re.compile(r"(?i)(?:USD\s*)?\$\s?[0-9][0-9,.]*(?:\s?[kmb])?|[0-9][0-9,.]*\s?(?:USD|USDC|DAI)")
+COMMON_TWO_LEVEL_SUFFIXES = {"co.uk", "org.uk", "com.au", "com.br", "co.jp", "co.kr", "com.sg"}
 
 
-class SourceError(RuntimeError):
-    pass
-
-
-@dataclass(slots=True)
-class HttpResponse:
-    url: str
-    status: int
-    body: bytes
-    content_type: str
-
-    @property
-    def text(self) -> str:
-        return self.body.decode("utf-8", errors="replace")
-
-    def json(self) -> Any:
-        return json.loads(self.text)
-
-
-def _validate_public_url(url: str) -> None:
+def clean_url(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise SourceError(f"unsupported URL: {url}")
-    host = parsed.hostname.lower().rstrip(".")
-    if host == "localhost" or host.endswith(".localhost"):
-        raise SourceError("local URLs are not allowed")
-    try:
-        address = ip_address(host)
-    except ValueError:
-        return
-    if not address.is_global:
-        raise SourceError("non-public IP addresses are not allowed")
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", parsed.query, ""))
 
 
-class HttpClient:
-    def __init__(self, timeout: float = 12, retries: int = 2, max_bytes: int = 2_000_000):
-        self.timeout = timeout
-        self.retries = retries
-        self.max_bytes = max_bytes
-        self._opener = build_opener()
-        self._cache: dict[str, HttpResponse] = {}
-
-    def get(
-        self,
-        url: str,
-        headers: dict[str, str] | None = None,
-        max_bytes: int | None = None,
-    ) -> HttpResponse:
-        _validate_public_url(url)
-        if url in self._cache:
-            return self._cache[url]
-        request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json,text/html;q=0.9,*/*;q=0.5"}
-        request_headers.update(headers or {})
-        last_error: Exception | None = None
-        response_limit = max_bytes or self.max_bytes
-        for attempt in range(self.retries + 1):
-            try:
-                request = Request(url, headers=request_headers)
-                with self._opener.open(request, timeout=self.timeout) as response:
-                    final_url = response.geturl()
-                    _validate_public_url(final_url)
-                    body = response.read(response_limit + 1)
-                    if len(body) > response_limit:
-                        raise SourceError(f"response exceeded {response_limit} bytes")
-                    result = HttpResponse(
-                        url=final_url,
-                        status=response.status,
-                        body=body,
-                        content_type=response.headers.get_content_type(),
-                    )
-                    self._cache[url] = result
-                    return result
-            except HTTPError as exc:
-                if exc.code in {404, 410}:
-                    raise SourceError(f"HTTP {exc.code}: {url}") from exc
-                last_error = exc
-            except (URLError, TimeoutError, ssl.SSLError, SourceError) as exc:
-                last_error = exc
-            if attempt < self.retries:
-                time.sleep(0.25 * (2**attempt))
-        raise SourceError(f"failed to fetch {url}: {last_error}")
+def hostname(url: str) -> str:
+    return (urlparse(url).hostname or "").lower().removeprefix("www.").rstrip(".")
 
 
-class _PageParser(HTMLParser):
+def domain_family(url: str) -> str:
+    host = hostname(url)
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    last_two = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if last_two in COMMON_TWO_LEVEL_SUFFIXES else last_two
+
+
+def is_same_family(first: str, second: str) -> bool:
+    return bool(domain_family(first)) and domain_family(first) == domain_family(second)
+
+
+def github_references(values: Iterable[str]) -> tuple[set[str], set[str]]:
+    repos: set[str] = set()
+    owners: set[str] = set()
+    reserved = {"orgs", "organizations", "features", "topics", "marketplace", "settings", "login", "search"}
+    for value in values:
+        match = GITHUB_RE.search(str(value))
+        if match:
+            owner = match.group(1)
+            repo = match.group(2).removesuffix(".git").strip("/")
+            if owner.lower() in reserved:
+                continue
+            owners.add(owner)
+            if repo and repo.lower() not in reserved:
+                repos.add(f"{owner}/{repo}")
+        elif re.fullmatch(r"[\w.-]+/[\w.-]+", str(value)):
+            owner, repo = str(value).split("/", 1)
+            owners.add(owner)
+            repos.add(f"{owner}/{repo.removesuffix('.git')}")
+    return repos, owners
+
+
+class _DocumentParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.text_parts: list[str] = []
         self.links: list[str] = []
+        self.sections: dict[str, list[str]] = {"document": []}
+        self.current_section = "document"
+        self._heading_parts: list[str] = []
+        self._heading_tag = ""
+        self._title_parts: list[str] = []
+        self._in_title = False
         self._ignored_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "svg"}:
+        if tag in {"script", "style", "svg", "noscript"}:
             self._ignored_depth += 1
-        if tag == "a":
-            href = dict(attrs).get("href")
-            if href:
-                self.links.append(href)
+            return
+        if self._ignored_depth:
+            return
+        attrs_map = dict(attrs)
+        if tag == "a" and attrs_map.get("href"):
+            self.links.append(str(attrs_map["href"]))
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._heading_tag = tag
+            self._heading_parts = []
+        if tag == "title":
+            self._in_title = True
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "svg"} and self._ignored_depth:
-            self._ignored_depth -= 1
+        if tag in {"script", "style", "svg", "noscript"}:
+            if self._ignored_depth:
+                self._ignored_depth -= 1
+            return
+        if self._ignored_depth:
+            return
+        if tag == self._heading_tag:
+            heading = re.sub(r"\s+", " ", " ".join(self._heading_parts)).strip().lower()
+            if heading:
+                self.current_section = heading[:160]
+                self.sections.setdefault(self.current_section, [])
+            self._heading_tag = ""
+        if tag == "title":
+            self._in_title = False
 
     def handle_data(self, data: str) -> None:
-        if not self._ignored_depth and data.strip():
-            self.text_parts.append(data.strip())
+        if self._ignored_depth:
+            return
+        value = re.sub(r"\s+", " ", data).strip()
+        if not value:
+            return
+        self.text_parts.append(value)
+        self.sections.setdefault(self.current_section, []).append(value)
+        if self._heading_tag:
+            self._heading_parts.append(value)
+        if self._in_title:
+            self._title_parts.append(value)
+
+    @property
+    def title(self) -> str:
+        return " ".join(self._title_parts).strip()
 
 
-def parse_page(html: str, base_url: str) -> tuple[str, list[str]]:
-    parser = _PageParser()
-    parser.feed(html)
+def parse_document(source_url: str, final_url: str, body: str, content_type: str) -> PageDocument:
+    if "html" not in content_type and not body.lstrip().startswith(("<", "<!")):
+        text = re.sub(r"\s+", " ", body).strip()
+        sections: dict[str, str] = {"document": text}
+        current = "document"
+        buckets: dict[str, list[str]] = {current: []}
+        for line in body.splitlines():
+            heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+            if heading:
+                current = heading.group(1).strip().lower()[:160]
+                buckets.setdefault(current, [])
+            elif line.strip():
+                buckets.setdefault(current, []).append(line.strip())
+        sections.update({key: re.sub(r"\s+", " ", " ".join(values)).strip() for key, values in buckets.items() if values})
+        lines = body.splitlines()
+        rst_buckets: dict[str, list[str]] = {}
+        current_rst = "document"
+        for index, line in enumerate(lines):
+            if index + 1 < len(lines) and line.strip() and re.fullmatch(r"\s*[=~`^\-:*+#<>]{3,}\s*", lines[index + 1]):
+                current_rst = line.strip().lower()[:160]
+                rst_buckets.setdefault(current_rst, [])
+                continue
+            if index > 0 and re.fullmatch(r"\s*[=~`^\-:*+#<>]{3,}\s*", line):
+                continue
+            if line.strip():
+                rst_buckets.setdefault(current_rst, []).append(line.strip())
+        sections.update({key: re.sub(r"\s+", " ", " ".join(values)).strip() for key, values in rst_buckets.items() if values})
+        links = re.findall(r"https?://[^\s)>\]]+", body)
+        return PageDocument(source_url, final_url, "", text, sorted(set(links)), sections)
+    parser = _DocumentParser()
+    parser.feed(body)
     text = re.sub(r"\s+", " ", " ".join(parser.text_parts)).strip()
-    links = [urljoin(base_url, href) for href in parser.links]
-    return text, links
-
-
-def registrable_host(url: str) -> str:
-    # Conservative equality helper; it intentionally does not guess public suffixes.
-    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
-    return host
-
-
-def _parse_github_repos(values: Iterable[str]) -> list[str]:
-    repos: set[str] = set()
-    for value in values:
-        match = re.search(r"github\.com/([^/#?]+)/([^/#?]+)", value, re.I)
-        if match:
-            owner, repo = match.group(1), match.group(2).removesuffix(".git")
-            if repo.lower() not in {"orgs", "repositories"}:
-                repos.add(f"{owner}/{repo}")
-        elif re.fullmatch(r"[\w.-]+/[\w.-]+", value):
-            repos.add(value)
-    return sorted(repos)
+    links = [clean_url(urljoin(final_url, link)) for link in parser.links if link and not link.startswith(("javascript:", "data:"))]
+    sections = {heading: re.sub(r"\s+", " ", " ".join(values)).strip() for heading, values in parser.sections.items()}
+    return PageDocument(source_url, final_url, parser.title, text, sorted(set(links)), sections)
 
 
 class DefiLlamaSource:
@@ -191,276 +192,287 @@ class DefiLlamaSource:
     def __init__(self, http: HttpClient):
         self.http = http
 
-    def protocols(self) -> list[Protocol]:
-        payload = self.http.get(f"{self.API}/protocols", max_bytes=25_000_000).json()
-        result: list[Protocol] = []
-        for raw in payload:
-            slug = str(raw.get("slug") or raw.get("name") or raw.get("id"))
-            listed = raw.get("listedAt")
-            listed_at = datetime.fromtimestamp(listed, timezone.utc) if isinstance(listed, (int, float)) else None
-            result.append(
-                Protocol(
-                    id=str(raw.get("id") or slug),
-                    name=str(raw.get("name") or slug),
-                    slug=slug,
-                    category=str(raw.get("category") or "Unknown"),
-                    chains=list(raw.get("chains") or []),
-                    tvl=float(raw.get("tvl") or 0),
-                    website=str(raw.get("url") or ""),
-                    defillama_url=f"https://defillama.com/protocol/{slug}",
-                    github_repos=_parse_github_repos(raw.get("github") or []),
-                    audits=int(raw.get("audits") or 0) if str(raw.get("audits") or "0").isdigit() else 0,
-                    listed_at=listed_at,
-                )
-            )
-        return result
+    def fetch_universe(self) -> tuple[list[Protocol], str]:
+        response = self.http.get(f"{self.API}/protocols", max_bytes=30_000_000, cache=False)
+        raw_protocols = response.json()
+        protocols: list[Protocol] = []
+        for raw in raw_protocols:
+            protocol = self._from_raw(raw)
+            if protocol.id and protocol.slug:
+                protocols.append(protocol)
+        return protocols, stable_hash(response.body)
 
-    def enrich(self, protocol: Protocol) -> Protocol:
+    def fetch_detail(self, protocol: Protocol) -> Protocol:
         try:
-            raw = self.http.get(f"{self.API}/protocol/{protocol.slug}").json()
+            response = self.http.get(f"{self.API}/protocol/{protocol.slug}", max_bytes=20_000_000, cache=False)
+            raw = response.json()
         except (SourceError, json.JSONDecodeError):
             return protocol
-        github_values: list[str] = []
+        protocol.website = str(raw.get("url") or protocol.website)
+        values: list[str] = list(protocol.github_refs)
         github = raw.get("github")
         if isinstance(github, str):
-            github_values.append(github)
+            values.append(github)
         elif isinstance(github, list):
-            github_values.extend(str(value) for value in github)
-        protocol.github_repos = sorted(set(protocol.github_repos + _parse_github_repos(github_values)))
+            values.extend(str(value) for value in github)
+        protocol.github_refs = sorted(set(values))
+        protocol.audit_links = list(raw.get("audit_links") or protocol.audit_links)
+        protocol.audits = _int_value(raw.get("audits"), protocol.audits)
+        # Store useful metadata, not multi-megabyte historical arrays.
+        for key in ("url", "description", "twitter", "github", "audit_links", "audits", "oracles", "forkedFrom", "listedAt"):
+            if key in raw:
+                protocol.raw[key] = raw[key]
         return protocol
 
+    @staticmethod
+    def _from_raw(raw: dict[str, Any]) -> Protocol:
+        identifier = str(raw.get("id") or raw.get("slug") or "")
+        slug = str(raw.get("slug") or raw.get("name") or identifier).strip().lower().replace(" ", "-")
+        github = raw.get("github") or []
+        github_refs = [github] if isinstance(github, str) else [str(value) for value in github]
+        chain_tvls = {str(key): float(value or 0) for key, value in (raw.get("chainTvls") or {}).items() if isinstance(value, (int, float))}
+        return Protocol(
+            id=identifier, name=str(raw.get("name") or slug), slug=slug,
+            category=str(raw.get("category") or "Unknown"), chains=[str(value) for value in raw.get("chains") or []],
+            tvl=float(raw.get("tvl") or 0), website=str(raw.get("url") or ""),
+            defillama_url=f"https://defillama.com/protocol/{slug}", symbol=str(raw.get("symbol") or ""),
+            chain_tvls=chain_tvls, change_1d=_float_or_none(raw.get("change_1d")),
+            change_7d=_float_or_none(raw.get("change_7d")), github_refs=github_refs,
+            audits=_int_value(raw.get("audits"), 0), audit_links=list(raw.get("audit_links") or []), raw=raw,
+        )
 
-class BountyDetector:
-    def __init__(self, http: HttpClient):
+
+@dataclass(slots=True)
+class DiscoveryResult:
+    pages: list[PageDocument]
+    bounty: BountyFinding
+    scope: ScopeFinding
+    github_repos: set[str]
+    github_owners: set[str]
+
+
+class OfficialSiteResearcher:
+    def __init__(self, http: HttpClient, max_pages: int = 16):
         self.http = http
+        self.max_pages = max_pages
 
-    def detect(self, protocol: Protocol, override: dict[str, Any] | None = None) -> BountyFinding:
-        if override:
-            return _bounty_from_override(override)
+    def research(self, protocol: Protocol) -> DiscoveryResult:
         if not protocol.website:
-            return BountyFinding(BountyType.UNKNOWN)
-        base = protocol.website.rstrip("/")
-        official_host = registrable_host(base)
-        saw_official_site = False
-        platform_evidence: list[Evidence] = []
-        for path in BOUNTY_PATHS:
-            url = urljoin(base + "/", path.lstrip("/"))
+            bounty = BountyFinding(BountyType.UNKNOWN, reason="DeFiLlama has no official website URL")
+            repos, owners = github_references(protocol.github_refs)
+            return DiscoveryResult([], bounty, ScopeFinding(), repos, owners)
+        base = clean_url(protocol.website)
+        queue: deque[str] = deque([base, *[urljoin(base, path) for path in SECURITY_PATHS]])
+        visited: set[str] = set()
+        pages: list[PageDocument] = []
+        all_links: set[str] = set(protocol.github_refs)
+        while queue and len(pages) < self.max_pages:
+            url = clean_url(queue.popleft())
+            if url in visited:
+                continue
+            visited.add(url)
+            if not is_same_family(base, url):
+                continue
             try:
-                response = self.http.get(url)
+                response = self.http.get(url, cache=False)
             except SourceError:
                 continue
-            final_host = registrable_host(response.url)
-            if final_host != official_host:
-                if any(final_host == host or final_host.endswith("." + host) for host in PLATFORM_HOSTS):
-                    platform_evidence.append(Evidence(response.url, response.url, "official-redirect", 0.95))
+            if response.content_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
                 continue
-            saw_official_site = True
-            text, links = parse_page(response.text, response.url)
-            corpus = text.lower()
-            relevant = "bug bounty" in corpus or ("security" in corpus and "reward" in corpus and "report" in corpus)
-            linked_platforms = [link for link in links if any(host in registrable_host(link) for host in PLATFORM_HOSTS)]
-            if relevant and linked_platforms:
-                platform_evidence.append(
-                    Evidence(linked_platforms[0], response.url, "official-bounty-page", 0.96, note="official page links to platform")
-                )
-                continue
-            if relevant:
-                evidence = Evidence(
-                    value="first-party bug bounty page",
-                    source=response.url,
-                    source_type="official-bounty-page",
-                    confidence=0.94,
-                    note="bounty and direct reporting/reward language found on official origin",
-                )
-                scope_status = "CONFIRMED" if any(term in corpus for term in ("in scope", "out of scope", "scope")) else "EVIDENCE_NOT_FOUND"
-                return BountyFinding(
-                    bounty_type=BountyType.FIRST_PARTY,
-                    url=response.url,
-                    host=official_host,
-                    scope_url=response.url if scope_status == "CONFIRMED" else "",
-                    scope_status=scope_status,
-                    evidence=[evidence],
-                    confidence=0.94,
-                )
-        if platform_evidence:
-            return BountyFinding(
-                bounty_type=BountyType.PLATFORM_HOSTED,
-                url=str(platform_evidence[0].value),
-                host=registrable_host(str(platform_evidence[0].value)),
-                evidence=platform_evidence,
-                confidence=max(item.confidence for item in platform_evidence),
+            document = parse_document(url, response.url, response.text, response.content_type)
+            pages.append(document)
+            all_links.update(document.links)
+            ranked_links = sorted(
+                (link for link in document.links if is_same_family(base, link) and link not in visited
+                 and not urlparse(link).path.lower().endswith(BINARY_EXTENSIONS)),
+                key=_relevant_url_score,
+                reverse=True,
             )
+            for link in ranked_links:
+                if _relevant_url_score(link) > 0:
+                    queue.append(link)
+        repos, owners = github_references(all_links)
+        bounty = classify_bounty(base, pages)
+        scope = extract_scope(protocol, pages, bounty)
+        return DiscoveryResult(pages, bounty, scope, repos, owners)
+
+
+def classify_bounty(official_url: str, pages: list[PageDocument]) -> BountyFinding:
+    checked = [page.final_url for page in pages]
+    platform_evidence: list[Evidence] = []
+    first_party_candidates: list[tuple[int, PageDocument, str]] = []
+    official_family = domain_family(official_url)
+    for page in pages:
+        corpus = page.text.lower()
+        phrase_score = 0
+        if "bug bounty" in corpus:
+            phrase_score += 3
+        if "vulnerability disclosure" in corpus or "responsible disclosure" in corpus:
+            phrase_score += 1
+        if "reward" in corpus or "bounty reward" in corpus:
+            phrase_score += 1
+        platform_links = [link for link in page.links if any(hostname(link) == host or hostname(link).endswith("." + host) for host in PLATFORM_HOSTS)]
+        for link in platform_links:
+            platform_evidence.append(Evidence(
+                "bounty hosted by external platform", link, page.final_url, "official-page-link", 1.0,
+                excerpt=_excerpt(page.text, "bug bounty"),
+            ))
+        emails = EMAIL_RE.findall(page.text)
+        official_emails = [email for email in emails if email.lower().endswith("@" + official_family)]
+        direct_links = [link for link in page.links if is_same_family(official_url, link) and any(term in link.lower() for term in ("submit", "report", "contact"))]
+        direct_language = any(term in corpus for term in ("email us", "report a vulnerability", "submit a vulnerability", "send your report"))
+        direct = official_emails[0] if official_emails else (direct_links[0] if direct_links else (page.final_url if direct_language else ""))
+        if phrase_score >= 3 and direct and not platform_links:
+            first_party_candidates.append((phrase_score, page, direct))
+    if first_party_candidates:
+        score, page, submission = max(first_party_candidates, key=lambda item: item[0])
+        evidence = Evidence(
+            "first-party bounty accepts direct reports", submission, page.final_url, "official-bounty-page", 1.0,
+            excerpt=_excerpt(page.text, "bug bounty"),
+        )
         return BountyFinding(
-            BountyType.NO_BOUNTY_FOUND if saw_official_site else BountyType.UNKNOWN,
-            confidence=0.6 if saw_official_site else 0.0,
+            BountyType.FIRST_PARTY, page.final_url, hostname(page.final_url), submission,
+            [evidence], min(1.0, 0.7 + score * 0.06), checked,
+            "Official-domain bounty language and a direct first-party submission channel were both found.",
         )
-
-
-class ScopeExtractor:
-    def __init__(self, http: HttpClient):
-        self.http = http
-
-    def extract(self, bounty: BountyFinding) -> ScopeFinding:
-        if bounty.bounty_type != BountyType.FIRST_PARTY or not bounty.url:
-            return ScopeFinding()
-        try:
-            response = self.http.get(bounty.scope_url or bounty.url)
-        except SourceError:
-            return ScopeFinding()
-        text, _ = parse_page(response.text, response.url)
-        patterns = {
-            "in_scope": r"(?i)(?:in[ -]scope|eligible (?:assets|targets|impacts?))\s*[:\-]?\s*(.{10,500}?)(?=out[ -]of[ -]scope|rules?|rewards?|$)",
-            "out_of_scope": r"(?i)(?:out[ -]of[ -]scope|excluded)\s*[:\-]?\s*(.{10,500}?)(?=in[ -]scope|rules?|rewards?|$)",
-            "rules": r"(?i)(?:rules?|testing restrictions?|responsible disclosure)\s*[:\-]?\s*(.{10,500}?)(?=rewards?|in[ -]scope|out[ -]of[ -]scope|$)",
-            "rewards": r"(?i)(?:rewards?|severity)\s*[:\-]?\s*(.{10,500}?)(?=rules?|in[ -]scope|out[ -]of[ -]scope|$)",
-        }
-        found: dict[str, list[Evidence]] = {key: [] for key in patterns}
-        for key, pattern in patterns.items():
-            match = re.search(pattern, text)
-            if match:
-                value = match.group(1).strip(" :-")[:500]
-                found[key].append(Evidence(value, response.url, "official-bounty-page", 0.9))
-        confirmed = bool(found["in_scope"] or found["out_of_scope"])
-        populated = sum(bool(value) for value in found.values())
-        return ScopeFinding(
-            status="CONFIRMED" if confirmed else "EVIDENCE_NOT_FOUND",
-            in_scope=found["in_scope"],
-            out_of_scope=found["out_of_scope"],
-            rules=found["rules"],
-            rewards=found["rewards"],
-            confidence=round(min(0.95, 0.55 + populated * 0.1), 2) if populated else 0,
+    if platform_evidence:
+        return BountyFinding(
+            BountyType.PLATFORM_HOSTED, str(platform_evidence[0].value), hostname(str(platform_evidence[0].value)), "",
+            platform_evidence, 1.0, checked, "Official material directs researchers to an external bounty platform.",
         )
+    if pages:
+        return BountyFinding(
+            BountyType.NO_BOUNTY_FOUND, confidence=0.0, checked_urls=checked,
+            reason="No qualifying first-party bounty evidence was found on the official pages checked; absence is not proven.",
+        )
+    return BountyFinding(BountyType.UNKNOWN, confidence=0.0, checked_urls=checked, reason="Official pages could not be retrieved.")
 
 
-class GitHubSource:
-    API = "https://api.github.com"
-
-    def __init__(self, http: HttpClient, token: str | None = None):
-        self.http = http
-        self.token = token or os.getenv("GITHUB_TOKEN", "")
-
-    @property
-    def headers(self) -> dict[str, str]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        return headers
-
-    def recent_changes(self, repository: str, days: int, max_commits: int = 12) -> list[Change]:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
-        url = f"{self.API}/repos/{repository}/commits?since={since}&per_page={max_commits}"
-        try:
-            commits = self.http.get(url, self.headers).json()
-        except (SourceError, json.JSONDecodeError):
-            return []
-        result: list[Change] = []
-        for item in commits[:max_commits]:
-            sha = str(item.get("sha") or "")
-            if not sha:
-                continue
-            try:
-                detail = self.http.get(f"{self.API}/repos/{repository}/commits/{sha}", self.headers).json()
-            except (SourceError, json.JSONDecodeError):
-                continue
-            commit_data = detail.get("commit") or {}
-            author = commit_data.get("committer") or commit_data.get("author") or {}
-            timestamp = parse_datetime(author.get("date")) or utc_now()
-            file_data = detail.get("files") or []
-            filenames = [str(value.get("filename")) for value in file_data if value.get("filename")]
-            patches = [str(value.get("patch"))[:20_000] for value in file_data if value.get("patch")]
+def classify_official_github_security(official_url: str, pages: list[PageDocument]) -> BountyFinding:
+    """Classify security/bounty documents only after their repositories were linked by an official source."""
+    platform: list[Evidence] = []
+    for page in pages:
+        corpus = page.text.lower()
+        if "bug bounty" not in corpus:
+            continue
+        platform_links = [link for link in page.links if any(hostname(link) == host or hostname(link).endswith("." + host) for host in PLATFORM_HOSTS)]
+        if platform_links:
+            platform.append(Evidence(
+                "official repository security policy links to bounty platform", platform_links[0], page.final_url,
+                "official-github-security-policy", 1.0, excerpt=_excerpt(page.text, "bug bounty"),
+            ))
+            continue
+        emails = EMAIL_RE.findall(page.text)
+        official_family = domain_family(official_url)
+        official_emails = [email for email in emails if official_family and email.lower().endswith("@" + official_family)]
+        official_links = [link for link in page.links if is_same_family(official_url, link) and any(term in link.lower() for term in ("security", "report", "bounty", "contact"))]
+        direct = official_emails[0] if official_emails else (official_links[0] if official_links else "")
+        if direct and ("reward" in corpus or "bounty" in corpus):
             evidence = Evidence(
-                value=sha,
-                source=str(detail.get("html_url") or item.get("html_url") or ""),
-                source_type="github-commit",
-                confidence=0.92,
+                "official repository publishes direct first-party bounty instructions", direct, page.final_url,
+                "official-github-security-policy", 1.0, excerpt=_excerpt(page.text, "bug bounty"),
             )
-            result.append(
-                Change(
-                    repository=repository,
-                    commit=sha,
-                    url=evidence.source,
-                    committed_at=timestamp,
-                    message=str(commit_data.get("message") or "").splitlines()[0],
-                    changed_files=filenames,
-                    patches=patches,
-                    evidence=[evidence],
-                )
+            return BountyFinding(
+                BountyType.FIRST_PARTY, page.final_url, hostname(page.final_url), direct, [evidence], 0.95,
+                [page.final_url for page in pages],
+                "An officially linked repository document contains bounty terms and a direct first-party channel.",
             )
-        return result
+    if platform:
+        return BountyFinding(
+            BountyType.PLATFORM_HOSTED, str(platform[0].value), hostname(str(platform[0].value)), "", platform, 1.0,
+            [page.final_url for page in pages], "Official repository security policy directs researchers to a platform.",
+        )
+    return BountyFinding(BountyType.UNKNOWN, checked_urls=[page.final_url for page in pages], reason="No qualifying bounty evidence in official repository security policies.")
 
 
-def _bounty_from_override(raw: dict[str, Any]) -> BountyFinding:
-    bounty_type = BountyType(raw.get("type", "UNKNOWN"))
-    url = str(raw.get("url") or "")
-    confidence = float(raw.get("confidence") or 0)
-    evidence = []
-    if url:
-        evidence.append(Evidence(raw.get("claim", bounty_type.value), url, "manual-official-source", confidence))
-    return BountyFinding(
-        bounty_type=bounty_type,
-        url=url,
-        host=registrable_host(url),
-        scope_url=str(raw.get("scope_url") or url),
-        scope_status=str(raw.get("scope_status") or "EVIDENCE_NOT_FOUND"),
-        evidence=evidence,
-        confidence=confidence,
-    )
+def extract_scope(protocol: Protocol, pages: list[PageDocument], bounty: BountyFinding) -> ScopeFinding:
+    if bounty.bounty_type != BountyType.FIRST_PARTY:
+        return ScopeFinding()
+    result = ScopeFinding()
+    relevant_pages = sorted(pages, key=lambda page: (page.final_url != bounty.url, -_relevant_url_score(page.final_url)))
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(group: str, kind: str, value: str, page: PageDocument, heading: str, confidence: float = 1.0) -> None:
+        clean = re.sub(r"\s+", " ", value).strip(" :-•\t")[:1000]
+        key = (group, kind, clean.lower())
+        if len(clean) < 2 or key in seen:
+            return
+        seen.add(key)
+        evidence = Evidence(f"scope {group}", clean, page.final_url, "official-bounty-scope", confidence,
+                            excerpt=f"{heading}: {clean}"[:1200])
+        getattr(result, group).append(ScopeItem(kind, clean, evidence))
+
+    for page in relevant_pages:
+        for heading, section in page.sections.items():
+            heading_lower = heading.lower()
+            group = ""
+            if any(term in heading_lower for term in ("out of scope", "out-of-scope", "excluded", "not eligible")):
+                group = "out_of_scope"
+            elif any(term in heading_lower for term in ("in scope", "in-scope", "eligible asset", "scope")):
+                group = "in_scope"
+            elif any(term in heading_lower for term in ("rule", "testing", "disclosure", "prohibited", "restriction", "requirement")):
+                group = "rules"
+            elif any(term in heading_lower for term in ("reward", "severity", "payout")):
+                group = "rewards"
+            if group:
+                for item in _split_scope_items(section):
+                    add(group, "text", item, page, heading)
+            for address in ADDRESS_RE.findall(section):
+                add("addresses", "contract_address", address, page, heading)
+            repos, _ = github_references(page.links + [section])
+            for repository in repos:
+                add("repositories", "github_repository", repository, page, heading)
+            for chain in protocol.chains:
+                if re.search(rf"(?i)\b{re.escape(chain)}\b", section):
+                    add("chains", "chain", chain, page, heading)
+            for amount in MONEY_RE.findall(section):
+                if "reward" in heading_lower or any(term in section.lower() for term in ("critical", "high", "medium", "low", "reward")):
+                    add("rewards", "amount", amount, page, heading)
+        corpus = page.text.lower()
+        rule_signals = {
+            "poc_required": ("proof of concept required", "poc required"),
+            "mainnet_testing_prohibited": ("do not test on mainnet", "mainnet testing is prohibited", "no mainnet testing"),
+            "kyc": ("kyc", "know your customer"),
+            "responsible_disclosure": ("responsible disclosure", "coordinated disclosure"),
+            "known_issues": ("known issues", "known vulnerabilities"),
+        }
+        for kind, terms in rule_signals.items():
+            term = next((term for term in terms if term in corpus), "")
+            if term:
+                add("rules", kind, _excerpt(page.text, term), page, "document", 0.95)
+    result.status = "CONFIRMED" if result.in_scope or result.out_of_scope or result.addresses else "EVIDENCE_NOT_FOUND"
+    confirmed_groups = sum(bool(getattr(result, name)) for name in ("in_scope", "out_of_scope", "rules", "rewards", "addresses"))
+    result.confidence = min(1.0, 0.55 + confirmed_groups * 0.09) if result.status == "CONFIRMED" else 0.0
+    return result
 
 
-def deployment_from_override(raw: dict[str, Any] | None) -> Deployment:
-    if not raw:
-        return Deployment()
-    source = str(raw.get("source") or "")
-    confidence = float(raw.get("confidence") or 0)
-    status = DeploymentStatus(raw.get("status", "UNKNOWN"))
-    evidence = []
-    if source:
-        evidence.append(Evidence(status.value, source, "manual-on-chain-source", confidence))
-    return Deployment(
-        status=status,
-        chain=str(raw.get("chain") or ""),
-        contract_address=str(raw.get("contract_address") or ""),
-        implementation_address=str(raw.get("implementation_address") or ""),
-        transaction_hash=str(raw.get("transaction_hash") or ""),
-        deployment_time=parse_datetime(raw.get("deployment_time")),
-        evidence=evidence,
-        confidence=confidence,
-    )
+def _split_scope_items(text: str) -> list[str]:
+    parts = re.split(r"(?:\s*[•▪◦]\s*|\s+[-–—]\s+|\n+|(?<=[.;])\s+(?=[A-Z0-9]))", text)
+    return [part.strip() for part in parts if 5 <= len(part.strip()) <= 1000][:80]
 
 
-def load_demo_fixture() -> dict[str, Any]:
-    fixture = files("defi_recon").joinpath("fixtures/demo.json")
-    return json.loads(fixture.read_text(encoding="utf-8"))
+def _relevant_url_score(url: str) -> int:
+    lower = url.lower()
+    return sum(2 if term in lower else 0 for term in RELEVANT_TERMS) - (2 if any(term in lower for term in ("blog", "press", "career")) else 0)
 
 
-def protocol_from_dict(raw: dict[str, Any]) -> Protocol:
-    return Protocol(
-        id=str(raw["id"]),
-        name=str(raw["name"]),
-        slug=str(raw["slug"]),
-        category=str(raw["category"]),
-        chains=list(raw.get("chains") or []),
-        tvl=float(raw.get("tvl") or 0),
-        website=str(raw.get("website") or ""),
-        defillama_url=str(raw.get("defillama_url") or ""),
-        github_repos=list(raw.get("github_repos") or []),
-        audits=int(raw.get("audits") or 0),
-        listed_at=parse_datetime(raw.get("listed_at")),
-    )
+def _excerpt(text: str, needle: str, radius: int = 220) -> str:
+    lower = text.lower()
+    index = lower.find(needle.lower())
+    if index < 0:
+        return text[: radius * 2]
+    return text[max(0, index - radius): index + len(needle) + radius].strip()
 
 
-def change_from_dict(raw: dict[str, Any]) -> Change:
-    source = str(raw.get("url") or "")
-    return Change(
-        repository=str(raw["repository"]),
-        commit=str(raw["commit"]),
-        url=source,
-        committed_at=parse_datetime(raw["committed_at"]) or utc_now(),
-        message=str(raw.get("message") or ""),
-        changed_files=list(raw.get("changed_files") or []),
-        patches=list(raw.get("patches") or []),
-        evidence=[Evidence(raw["commit"], source, "fixture-github-commit", float(raw.get("confidence") or 0.9))],
-    )
+def _int_value(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

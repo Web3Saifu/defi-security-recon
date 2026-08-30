@@ -1,0 +1,11 @@
+{
+  "rpc_urls": {
+    "1": "https://your-ethereum-rpc.example",
+    "10": "https://your-optimism-rpc.example",
+    "56": "https://your-bnb-chain-rpc.example",
+    "137": "https://your-polygon-rpc.example",
+    "8453": "https://your-base-rpc.example",
+    "42161": "https://your-arbitrum-rpc.example",
+    "43114": "https://your-avalanche-rpc.example"
+  }
+}

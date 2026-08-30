@@ -1,6 +1,7 @@
-# DeFi Security Recon V1–V5
+# DeFiLlama Research
 
-Live-source, evidence-first reconnaissance across the complete DeFiLlama protocol universe.
+**DeFiLlama Research** is a live-source, evidence-first research agent covering the complete DeFiLlama
+protocol universe. The current implementation includes V1–V5.
 
 This is a resumable research pipeline—not a demo-data target generator and not a vulnerability detector. It stores every protocol returned by DeFiLlama, progressively enriches each protocol from official and on-chain sources, and only ranks records that satisfy explicit evidence gates.
 

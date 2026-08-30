@@ -18,7 +18,10 @@ DEFAULT_REPORTS = PROJECT_ROOT / "reports"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="defi-recon", description="Live evidence-first DeFi security reconnaissance V1-V5")
+    parser = argparse.ArgumentParser(
+        prog="defillama-research",
+        description="DeFiLlama Research - live evidence-first protocol research agent (V1-V5)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     sync = commands.add_parser("sync", help="store every protocol returned by DeFiLlama")
@@ -88,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "status":
             if not args.database.exists():
-                print(f"No V2 database at {args.database}. Run `defi-recon sync` first.")
+                print(f"No V2 database at {args.database}. Run `defillama-research sync` first.")
                 return 1
             with ReconStore(args.database) as store:
                 print(render_status(store.status()))

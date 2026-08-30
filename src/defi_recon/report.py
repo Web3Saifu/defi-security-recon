@@ -24,7 +24,7 @@ def coverage(status: dict[str, Any]) -> tuple[int, int]:
 def render_status(status: dict[str, Any]) -> str:
     complete, total = coverage(status)
     lines = [
-        "# Recon Coverage Status", "", f"- DeFiLlama protocols stored: {total}",
+        "# DeFiLlama Research - Coverage Status", "", f"- DeFiLlama protocols stored: {total}",
         f"- Protocol research complete: {complete}/{total}",
         f"- Official repositories mapped: {status.get('repositories', 0)}",
         f"- Meaningful changes stored: {status.get('changes', 0)}",
@@ -42,7 +42,7 @@ def render_status(status: dict[str, Any]) -> str:
 def render_markdown(result: ResearchResult, options: ResearchOptions) -> str:
     complete, total = coverage(result.status)
     lines = [
-        "# DeFi Security Target Report", "", result.generated_at.strftime("%d %b %Y %H:%M UTC"), "",
+        "# DeFiLlama Research - Target Report", "", result.generated_at.strftime("%d %b %Y %H:%M UTC"), "",
         "## Coverage", "",
         f"- DeFiLlama universe stored: **{total} protocols**",
         f"- Research pipeline complete: **{complete}/{total} protocols**",
@@ -147,4 +147,3 @@ def report_from_store(targets: list[dict], status: dict, category: str, days: in
     options = ResearchOptions(category=category, days=days, min_score=min_score,
                               min_confidence=min_confidence, top=top, sync_universe=False)
     return ResearchResult(targets=targets, status=status), options
-
